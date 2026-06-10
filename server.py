@@ -76,12 +76,15 @@ async def sync_data(
     """Sync health data from Zepp Life cloud.
     data_types: daily_activity | sleep | workouts | body_measurements | heart_rate
     Dates: YYYY-MM-DD format. Defaults to last 30 days."""
-    if not await _adapter.connect():
+    # Fresh adapter per call avoids httpx event loop binding issues
+    adapter = CloudSessionAdapter(app_token=_app_token, user_id=_user_id, region=_cfg.region)
+    if not await adapter.connect():
         return {"error": "Cannot connect to Zepp Life API. Verify ZEPP_APP_TOKEN is valid."}
+    sync_svc = SyncService(adapter, _db)
     types = data_types or ["daily_activity", "sleep", "workouts", "body_measurements", "heart_rate"]
     results = []
     for dt in types:
-        r = await _sync_svc.sync_data_type(
+        r = await sync_svc.sync_data_type(
             dt, start_date=start_date, end_date=end_date, force_full=force_full_sync
         )
         results.append(r)
