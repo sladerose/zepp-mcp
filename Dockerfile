@@ -14,9 +14,6 @@ RUN uv pip install zepp-life-mcp "mcp[cli]>=1.0.0"
 # Copy the SSE wrapper server
 COPY server.py ./
 
-# Persistent data volume for the SQLite database
-VOLUME ["/data"]
-
 EXPOSE 8080
 
 ENTRYPOINT ["python", "server.py"]
