@@ -1,5 +1,7 @@
 import os
 import json
+import secrets
+import time
 from datetime import date as _date, timedelta
 from pathlib import Path
 
@@ -54,6 +56,16 @@ from zepp_life_mcp.storage import Database
 from zepp_life_mcp.services.sync_service import SyncService
 from zepp_life_mcp.services.query_service import QueryService
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.provider import (
+    OAuthAuthorizationServerProvider,
+    AuthorizationCode,
+    RefreshToken,
+    AccessToken,
+    AuthorizationParams,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 _cfg = load_config()
 _db = Database(_cfg.database_path)
@@ -63,7 +75,138 @@ _sync_svc = SyncService(_adapter, _db)
 _query_svc = QueryService(_db, _user_id)
 
 port = int(os.environ.get("PORT", "8080"))
-app = FastMCP("Zepp Life MCP", host="0.0.0.0", port=port)
+
+_raw_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+SERVER_URL = (
+    f"https://{_raw_domain}"
+    if _raw_domain and not _raw_domain.startswith("http")
+    else _raw_domain or f"http://localhost:{port}"
+)
+
+
+class _BypassOAuthProvider(
+    OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
+):
+    """Single-user bypass OAuth. Auto-approves all authorization requests.
+    Credentials are stored server-side in env vars — no user login needed."""
+
+    def __init__(self):
+        self._clients: dict = {}
+        self._auth_codes: dict = {}
+        self._access_tokens: dict = {}
+        self._refresh_tokens: dict = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._clients[client_info.client_id] = client_info
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        code = secrets.token_urlsafe(32)
+        self._auth_codes[code] = AuthorizationCode(
+            code=code,
+            scopes=params.scopes or [],
+            expires_at=time.time() + 300,
+            client_id=client.client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+        )
+        return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        code = self._auth_codes.get(authorization_code)
+        if code and code.expires_at > time.time():
+            return code
+        return None
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        self._auth_codes.pop(authorization_code.code, None)
+        access_token = secrets.token_urlsafe(32)
+        refresh_token_str = secrets.token_urlsafe(32)
+        expires_in = 365 * 24 * 3600
+        self._access_tokens[access_token] = AccessToken(
+            token=access_token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + expires_in,
+        )
+        self._refresh_tokens[refresh_token_str] = RefreshToken(
+            token=refresh_token_str,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+        )
+        return OAuthToken(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=expires_in,
+            refresh_token=refresh_token_str,
+            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        return self._refresh_tokens.get(refresh_token)
+
+    async def exchange_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list
+    ) -> OAuthToken:
+        access_token = secrets.token_urlsafe(32)
+        new_refresh = secrets.token_urlsafe(32)
+        expires_in = 365 * 24 * 3600
+        effective_scopes = scopes or refresh_token.scopes
+        self._access_tokens[access_token] = AccessToken(
+            token=access_token,
+            client_id=client.client_id,
+            scopes=effective_scopes,
+            expires_at=int(time.time()) + expires_in,
+        )
+        self._refresh_tokens.pop(refresh_token.token, None)
+        self._refresh_tokens[new_refresh] = RefreshToken(
+            token=new_refresh,
+            client_id=client.client_id,
+            scopes=effective_scopes,
+        )
+        return OAuthToken(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=expires_in,
+            refresh_token=new_refresh,
+            scope=" ".join(effective_scopes) if effective_scopes else None,
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        at = self._access_tokens.get(token)
+        if at and (at.expires_at is None or at.expires_at > time.time()):
+            return at
+        return None
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        t = getattr(token, "token", None)
+        if t:
+            self._access_tokens.pop(t, None)
+            self._refresh_tokens.pop(t, None)
+
+
+_oauth = _BypassOAuthProvider()
+
+app = FastMCP(
+    "Zepp Life MCP",
+    host="0.0.0.0",
+    port=port,
+    auth_server_provider=_oauth,
+    auth=AuthSettings(
+        issuer_url=SERVER_URL,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+        resource_server_url=SERVER_URL,
+    ),
+)
 
 
 @app.tool()
@@ -76,7 +219,6 @@ async def sync_data(
     """Sync health data from Zepp Life cloud.
     data_types: daily_activity | sleep | workouts | body_measurements | heart_rate
     Dates: YYYY-MM-DD format. Defaults to last 30 days."""
-    # Fresh adapter per call avoids httpx event loop binding issues
     adapter = CloudSessionAdapter(app_token=_app_token, user_id=_user_id, region=_cfg.region)
     if not await adapter.connect():
         return {"error": "Cannot connect to Zepp Life API. Verify ZEPP_APP_TOKEN is valid."}
